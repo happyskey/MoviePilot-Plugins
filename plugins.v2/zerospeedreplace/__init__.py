@@ -26,7 +26,7 @@ class ZeroSpeedReplace(_PluginBase):
     plugin_name = "零速撞种换种"
     plugin_desc = "下载速度长期为0时自动删种，并按下载历史tmdbid精确搜索换种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
-    plugin_version = "0.2.1"
+    plugin_version = "0.2.2"
     plugin_author = "community"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "zerospeedreplace_"
@@ -45,6 +45,7 @@ class ZeroSpeedReplace(_PluginBase):
     _cron = "*/5 * * * *"
     _max_per_run = 3
     _downloader = None
+    _blacklist_hours = 24  # 已删 hash 在此小时内不再选中
 
     _scheduler = None
     _downloadhis = None
@@ -385,6 +386,9 @@ class ZeroSpeedReplace(_PluginBase):
         if not self._delete_torrent(downloader_obj, str(torrent_hash), name):
             return False
 
+        # 防止下次换种又选回这个 hash
+        self._add_blacklist(str(torrent_hash))
+
         msg = (
             f"已删除零速任务：{media_title}\n"
             f"状态:{state} 速度:{speed_kb:.1f}KB/s 运行:{runtime_min:.0f}分钟\n"
@@ -409,7 +413,51 @@ class ZeroSpeedReplace(_PluginBase):
             )
         return True
 
+    def _blacklist_path(self):
+        return self.get_data_path() / "deleted_hashes.json"
+
+    def _load_blacklist(self) -> dict:
+        """hash -> expire_ts"""
+        import json, time
+        path = self._blacklist_path()
+        try:
+            if path.exists():
+                data = json.loads(path.read_text() or "{}")
+                now = time.time()
+                # 清理过期
+                data = {k: v for k, v in data.items() if float(v) > now}
+                return data
+        except Exception as e:
+            logger.debug(f"{self.plugin_name}: 读黑名单失败: {e}")
+        return {}
+
+    def _save_blacklist(self, data: dict):
+        import json
+        try:
+            path = self._blacklist_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        except Exception as e:
+            logger.warning(f"{self.plugin_name}: 写黑名单失败: {e}")
+
+    def _add_blacklist(self, torrent_hash: str):
+        import time
+        if not torrent_hash:
+            return
+        data = self._load_blacklist()
+        expire = time.time() + float(self._blacklist_hours) * 3600
+        data[torrent_hash.lower()] = expire
+        self._save_blacklist(data)
+        logger.info(f"{self.plugin_name}: 已加入黑名单 {torrent_hash} ({self._blacklist_hours}h)")
+
+    def _is_blacklisted(self, torrent_hash: str) -> bool:
+        if not torrent_hash:
+            return False
+        data = self._load_blacklist()
+        return torrent_hash.lower() in data
+
     def _extract_keyword(self, torrent_name: str) -> str:
+
         """从种子名提取搜索关键词（对齐 qboptimizer）"""
         import re
         name = torrent_name or ""
@@ -506,13 +554,19 @@ class ZeroSpeedReplace(_PluginBase):
             except Exception:
                 return 0
 
+        blacklist = self._load_blacklist()
         candidates = []
         for ctx in contexts:
             ti = getattr(ctx, "torrent_info", None)
             if not ti:
                 continue
             th = getattr(ti, "info_hash", None) or getattr(ti, "hash", None) or ""
-            if th and str(th).lower() == (old_hash or "").lower():
+            th_l = str(th).lower() if th else ""
+            if th_l and th_l == (old_hash or "").lower():
+                logger.info(f"{self.plugin_name}: 跳过原 hash: {th_l}")
+                continue
+            if th_l and th_l in blacklist:
+                logger.info(f"{self.plugin_name}: 跳过黑名单 hash: {th_l}")
                 continue
             candidates.append(ctx)
 
