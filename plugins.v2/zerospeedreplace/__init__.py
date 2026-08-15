@@ -4,20 +4,16 @@
 - 通过下载历史获取 tmdbid，精确搜索后换种
 - 仅建议处理 MoviePilot 添加的任务（有下载历史）
 """
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from app.core.config import settings
 from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.helper.downloader import DownloaderHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType, ServiceInfo
-from app.schemas.types import EventType
-from app.utils.string import StringUtils
 
 
 class ZeroSpeedReplace(_PluginBase):
@@ -28,7 +24,7 @@ class ZeroSpeedReplace(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
     # 插件版本（需与 package.v2.json 一致）
-    plugin_version = "0.1.1"
+    plugin_version = "0.1.2"
     # 插件作者
     plugin_author = "community"
     # 作者主页
@@ -53,12 +49,14 @@ class ZeroSpeedReplace(_PluginBase):
     _max_per_run = 3
     _downloader = None  # 指定下载器名称，空=默认
 
-    _scheduler: Optional[BackgroundScheduler] = None
     _downloadhis = None
     _downloader_helper = None
 
     def init_plugin(self, config: dict = None):
-        self.stop_service()
+        """
+        只读取配置。定时任务交给 get_service() 注册到 MoviePilot 主调度器，
+        不要自己起 BackgroundScheduler（在插件环境里经常不触发）。
+        """
         self._downloadhis = DownloadHistoryOper()
         self._downloader_helper = DownloaderHelper()
 
@@ -76,19 +74,12 @@ class ZeroSpeedReplace(_PluginBase):
             self._downloader = (config.get("downloader") or "").strip() or None
 
         if self._enabled:
-            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-            try:
-                self._scheduler.add_job(
-                    func=self.run_once,
-                    trigger=CronTrigger.from_crontab(self._cron),
-                    id="ZeroSpeedReplace",
-                    name="零速撞种换种",
-                    kwargs={"manual": False},
-                )
-                self._scheduler.start()
-                logger.info(f"{self.plugin_name} 已启动，周期: {self._cron}")
-            except Exception as e:
-                logger.error(f"{self.plugin_name} 定时任务配置错误: {e}")
+            logger.info(
+                f"{self.plugin_name} 已启用，将由系统调度执行，周期: {self._cron}；"
+                f"也可在「设定→服务」中手动运行"
+            )
+        else:
+            logger.info(f"{self.plugin_name} 未启用")
 
     def get_state(self) -> bool:
         return self._enabled
@@ -318,30 +309,29 @@ class ZeroSpeedReplace(_PluginBase):
         return []
 
     def stop_service(self):
-        try:
-            if self._scheduler:
-                self._scheduler.remove_all_jobs()
-                if self._scheduler.running:
-                    self._scheduler.shutdown()
-                self._scheduler = None
-        except Exception as e:
-            logger.error(f"停止插件服务失败: {e}")
+        """主调度器由系统管理，此处无需额外停止。"""
+        pass
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
-        注册到「设定 → 服务」可手动执行
+        注册到 MoviePilot 主调度器（设定→服务 可见，到点自动跑，也可手动点一次）
         """
-        if self._enabled:
-            return [
-                {
-                    "id": "ZeroSpeedReplace",
-                    "name": "零速撞种换种",
-                    "trigger": "interval",
-                    "func": self.run_once,
-                    "kwargs": {"manual": True},
-                }
-            ]
-        return []
+        if not self._enabled:
+            return []
+        try:
+            trigger = CronTrigger.from_crontab(self._cron)
+        except Exception as e:
+            logger.error(f"{self.plugin_name}: Cron 无效 [{self._cron}]: {e}，回退每5分钟")
+            trigger = CronTrigger.from_crontab("*/5 * * * *")
+        return [
+            {
+                "id": "ZeroSpeedReplace",
+                "name": "零速撞种换种",
+                "trigger": trigger,
+                "func": self.run_once,
+                "kwargs": {"manual": False},
+            }
+        ]
 
     def _get_downloader_service(self) -> Optional[ServiceInfo]:
         if not self._downloader_helper:
