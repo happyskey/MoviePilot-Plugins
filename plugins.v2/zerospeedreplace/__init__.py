@@ -26,7 +26,7 @@ class ZeroSpeedReplace(_PluginBase):
     plugin_name = "零速撞种换种"
     plugin_desc = "下载速度长期为0时自动删种，并按下载历史tmdbid精确搜索换种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
-    plugin_version = "0.2.4"
+    plugin_version = "0.2.5"
     plugin_author = "community"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "zerospeedreplace_"
@@ -46,6 +46,7 @@ class ZeroSpeedReplace(_PluginBase):
     _max_per_run = 3
     _downloader = None
     _blacklist_hours = 24  # 已删 hash 在此小时内不再选中
+    _max_downloaded_mb = 100  # 已下载小于该值(MB)才处理；0=不限制
 
     _scheduler = None
     _downloadhis = None
@@ -68,6 +69,7 @@ class ZeroSpeedReplace(_PluginBase):
             self._auto_replace = bool(config.get("auto_replace", True))
             self._cron = (config.get("cron") or "*/5 * * * *").strip()
             self._max_per_run = int(config.get("max_per_run") or 3)
+            self._max_downloaded_mb = float(config.get("max_downloaded_mb") if config.get("max_downloaded_mb") is not None else 100)
             self._downloader = (config.get("downloader") or "").strip() or None
 
         if self._onlyonce:
@@ -94,6 +96,7 @@ class ZeroSpeedReplace(_PluginBase):
                 "auto_replace": self._auto_replace,
                 "cron": self._cron,
                 "max_per_run": self._max_per_run,
+                "max_downloaded_mb": self._max_downloaded_mb,
                 "downloader": self._downloader or "",
             })
             self.update_config(cfg)
@@ -163,6 +166,20 @@ class ZeroSpeedReplace(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VTextField", "props": {
+                                    "model": "max_downloaded_mb",
+                                    "label": "已下载小于(MB)才处理",
+                                    "type": "number",
+                                    "placeholder": "100，0表示不限制",
+                                    "hint": "已下载量达到或超过此值则跳过，避免删掉已下很多的任务",
+                                    "persistent-hint": True,
+                                }}]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {"component": "VCol", "props": {"cols": 12}, "content": [
                                 {"component": "VTextField", "props": {"model": "downloader", "label": "下载器名称(空=默认)", "placeholder": "留空使用默认下载器"}}]},
                         ],
@@ -183,6 +200,7 @@ class ZeroSpeedReplace(_PluginBase):
             "enabled": False, "onlyonce": False, "notify": True, "auto_replace": True,
             "only_mp_tag": True, "mp_tag": "MOVIEPILOT", "delete_files": False,
             "min_runtime_min": 10, "zero_speed_kb": 5, "max_per_run": 3,
+            "max_downloaded_mb": 100,
             "cron": "*/5 * * * *", "downloader": "",
         }
 
@@ -258,6 +276,29 @@ class ZeroSpeedReplace(_PluginBase):
             return float(dlspeed) / 1024.0
         except Exception:
             return 0.0
+
+    def _torrent_downloaded_mb(self, torrent) -> float:
+        """已下载量 MB（优先 completed/downloaded）"""
+        for attr in ("completed", "downloaded", "total_downloaded", "downloaded_session"):
+            val = getattr(torrent, attr, None)
+            if val is None:
+                continue
+            try:
+                v = float(val)
+                if v < 0:
+                    continue
+                return v / (1024.0 * 1024.0)
+            except Exception:
+                continue
+        # 用 progress * size 估算
+        try:
+            size = float(getattr(torrent, "size", None) or getattr(torrent, "total_size", 0) or 0)
+            progress = self._torrent_progress(torrent)
+            if size > 0:
+                return size * progress / (1024.0 * 1024.0)
+        except Exception:
+            pass
+        return 0.0
 
     def _torrent_progress(self, torrent) -> float:
         progress = getattr(torrent, "progress", None)
@@ -354,6 +395,16 @@ class ZeroSpeedReplace(_PluginBase):
         if speed_kb > self._zero_speed_kb:
             return False
 
+        # 已下载体积阈值：超过则不删（0=不限制）
+        if self._max_downloaded_mb and self._max_downloaded_mb > 0:
+            downloaded_mb = self._torrent_downloaded_mb(torrent)
+            if downloaded_mb >= float(self._max_downloaded_mb):
+                logger.debug(
+                    f"{self.plugin_name}: 跳过(已下载过大) {name} "
+                    f"{downloaded_mb:.1f}MB >= {self._max_downloaded_mb}MB"
+                )
+                return False
+
         if self._only_mp_tag and self._mp_tag:
             tags = self._torrent_tags(torrent)
             tag_list = [t.strip() for t in tags.replace(";", ",").split(",") if t.strip()]
@@ -369,9 +420,10 @@ class ZeroSpeedReplace(_PluginBase):
         if runtime_min < self._min_runtime_min:
             return False
 
+        downloaded_mb = self._torrent_downloaded_mb(torrent)
         logger.info(
             f"{self.plugin_name}: 候选零速 | {name} | state={state} | "
-            f"{speed_kb:.1f}KB/s | 运行{runtime_min:.0f}分 | {torrent_hash}"
+            f"{speed_kb:.1f}KB/s | 已下{downloaded_mb:.1f}MB | 运行{runtime_min:.0f}分 | {torrent_hash}"
         )
 
         history = None
