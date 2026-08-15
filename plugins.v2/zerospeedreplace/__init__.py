@@ -28,7 +28,7 @@ class ZeroSpeedReplace(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
     # 插件版本（需与 package.v2.json 一致）
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     # 插件作者
     plugin_author = "community"
     # 作者主页
@@ -350,6 +350,91 @@ class ZeroSpeedReplace(_PluginBase):
             return self._downloader_helper.get_service(name=self._downloader)
         return self._downloader_helper.get_default_downloader()
 
+    def _list_candidate_torrents(self, downloader) -> List[Any]:
+        """
+        获取可能卡住的任务：下载中 + 停滞下载。
+        qB 里「停滞中」常不在 get_downloading_torrents() 结果里，必须额外拉取。
+        """
+        merged = []
+        seen = set()
+
+        def _add(items):
+            if not items:
+                return
+            for t in items:
+                info = self._normalize_torrent(t)
+                if not info or not info.get("hash"):
+                    # 仍保留原始对象，后面再 normalize
+                    merged.append(t)
+                    continue
+                h = info["hash"].lower()
+                if h in seen:
+                    continue
+                seen.add(h)
+                merged.append(t)
+
+        # 1) 下载中
+        try:
+            _add(downloader.get_downloading_torrents())
+        except Exception as e:
+            logger.warning(f"{self.plugin_name}: get_downloading_torrents 失败: {e}")
+
+        # 2) 全部任务里筛未完成（覆盖 stalledDL / metaDL 等）
+        for method_name in ("get_torrents", "get_all_torrents", "torrents_info"):
+            if not hasattr(downloader, method_name):
+                continue
+            try:
+                method = getattr(downloader, method_name)
+                all_list = method()
+                if all_list is None:
+                    continue
+                unfinished = []
+                for t in all_list:
+                    info = self._normalize_torrent(t)
+                    if not info:
+                        continue
+                    # 未完成且非做种完成
+                    if info["progress"] < 0.99:
+                        unfinished.append(t)
+                _add(unfinished)
+                logger.info(
+                    f"{self.plugin_name}: 通过 {method_name} 补充未完成任务，合并后共 {len(merged)} 个"
+                )
+                break
+            except TypeError:
+                # 部分实现需要参数，尝试 status 过滤
+                try:
+                    method = getattr(downloader, method_name)
+                    for status in (None, "downloading", "stalled_downloading", "stalledDL"):
+                        try:
+                            if status is None:
+                                all_list = method()
+                            else:
+                                all_list = method(status=status)
+                            if all_list:
+                                _add(all_list)
+                        except Exception:
+                            continue
+                except Exception as e:
+                    logger.debug(f"{self.plugin_name}: {method_name} 备选调用失败: {e}")
+            except Exception as e:
+                logger.debug(f"{self.plugin_name}: {method_name} 失败: {e}")
+
+        # 3) qB 原生：若 instance 上有 qbc / transfer
+        try:
+            if hasattr(downloader, "qbc") and downloader.qbc:
+                # qbittorrent-api: torrents.info(status_filter='downloading') 不含 stalled
+                # 用 downloading + stalled_downloading
+                for sf in ("downloading", "stalled_downloading", "active"):
+                    try:
+                        _add(list(downloader.qbc.torrents.info(status_filter=sf)))
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.debug(f"{self.plugin_name}: qbc 补充失败: {e}")
+
+        return merged
+
     def run_once(self, manual: bool = False):
         """
         执行一次检查与换种
@@ -365,15 +450,18 @@ class ZeroSpeedReplace(_PluginBase):
         downloader = service.instance
         name = service.name
 
+        logger.info(f"{self.plugin_name}: 开始检查下载器 [{name}] ...")
         try:
-            torrents = downloader.get_downloading_torrents()
+            torrents = self._list_candidate_torrents(downloader)
         except Exception as e:
-            logger.error(f"{self.plugin_name}: 获取下载中任务失败 [{name}]: {e}")
+            logger.error(f"{self.plugin_name}: 获取任务列表失败 [{name}]: {e}")
             return
 
         if not torrents:
-            logger.info(f"{self.plugin_name}: 当前无下载中任务")
+            logger.info(f"{self.plugin_name}: 当前无未完成/下载中任务（含停滞）")
             return
+
+        logger.info(f"{self.plugin_name}: 待检查任务数 {len(torrents)}")
 
         handled = 0
         for torrent in torrents:
@@ -385,8 +473,7 @@ class ZeroSpeedReplace(_PluginBase):
             except Exception as e:
                 logger.error(f"{self.plugin_name}: 处理种子异常: {e}")
 
-        if handled:
-            logger.info(f"{self.plugin_name}: 本轮处理 {handled} 个任务")
+        logger.info(f"{self.plugin_name}: 本轮结束，处理 {handled} 个任务")
 
     def _process_torrent(self, downloader, downloader_name: str, torrent) -> bool:
         """
