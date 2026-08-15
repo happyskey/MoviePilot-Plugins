@@ -24,7 +24,7 @@ class ZeroSpeedReplace(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
     # 插件版本（需与 package.v2.json 一致）
-    plugin_version = "0.1.2"
+    plugin_version = "0.1.3"
     # 插件作者
     plugin_author = "community"
     # 作者主页
@@ -48,17 +48,18 @@ class ZeroSpeedReplace(_PluginBase):
     _cron = "*/5 * * * *"
     _max_per_run = 3
     _downloader = None  # 指定下载器名称，空=默认
+    _onlyonce = False
 
     _downloadhis = None
     _downloader_helper = None
 
     def init_plugin(self, config: dict = None):
         """
-        只读取配置。定时任务交给 get_service() 注册到 MoviePilot 主调度器，
-        不要自己起 BackgroundScheduler（在插件环境里经常不触发）。
+        只读取配置。定时任务交给 get_service() 注册到 MoviePilot 主调度器。
         """
         self._downloadhis = DownloadHistoryOper()
         self._downloader_helper = DownloaderHelper()
+        self._onlyonce = False
 
         if config:
             self._enabled = config.get("enabled", False)
@@ -72,11 +73,16 @@ class ZeroSpeedReplace(_PluginBase):
             self._cron = (config.get("cron") or "*/5 * * * *").strip()
             self._max_per_run = int(config.get("max_per_run") or 3)
             self._downloader = (config.get("downloader") or "").strip() or None
+            self._onlyonce = bool(config.get("onlyonce", False))
+
+        # onlyonce 由 get_service 消费并复位，这里只打日志
+        if self._onlyonce:
+            logger.info(f"{self.plugin_name}: 已勾选立即运行一次，等待系统调度（约数秒）")
 
         if self._enabled:
             logger.info(
-                f"{self.plugin_name} 已启用，将由系统调度执行，周期: {self._cron}；"
-                f"也可在「设定→服务」中手动运行"
+                f"{self.plugin_name} 已启用，周期: {self._cron}；"
+                f"请在「设定→服务」确认有本服务，或勾选「立即运行一次」后保存"
             )
         else:
             logger.info(f"{self.plugin_name} 未启用")
@@ -134,6 +140,24 @@ class ZeroSpeedReplace(_PluginBase):
                                         "props": {
                                             "model": "auto_replace",
                                             "label": "自动换种",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "onlyonce",
+                                            "label": "立即运行一次",
                                         },
                                     }
                                 ],
@@ -295,6 +319,7 @@ class ZeroSpeedReplace(_PluginBase):
             "enabled": False,
             "notify": True,
             "auto_replace": True,
+            "onlyonce": False,
             "only_mp_tag": True,
             "mp_tag": "MOVIEPILOT",
             "delete_files": False,
@@ -314,24 +339,51 @@ class ZeroSpeedReplace(_PluginBase):
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
-        注册到 MoviePilot 主调度器（设定→服务 可见，到点自动跑，也可手动点一次）
+        注册到 MoviePilot 主调度器（设定→服务 可见）
+        注意：kwargs 是传给触发器/任务的调度参数，不要塞业务参数。
         """
         if not self._enabled:
             return []
+
+        services: List[Dict[str, Any]] = []
+
+        # 周期任务
         try:
             trigger = CronTrigger.from_crontab(self._cron)
         except Exception as e:
-            logger.error(f"{self.plugin_name}: Cron 无效 [{self._cron}]: {e}，回退每5分钟")
+            logger.error(f"{self.plugin_name}: Cron 无效 [{self._cron}]: {e}，回退 */5 * * * *")
             trigger = CronTrigger.from_crontab("*/5 * * * *")
-        return [
-            {
-                "id": "ZeroSpeedReplace",
-                "name": "零速撞种换种",
-                "trigger": trigger,
+
+        services.append({
+            "id": "ZeroSpeedReplace",
+            "name": "零速撞种换种",
+            "trigger": trigger,
+            "func": self.run_once,
+            "kwargs": {},
+        })
+
+        # 立即运行一次（date 触发）
+        if self._onlyonce:
+            from datetime import timedelta
+            services.append({
+                "id": "ZeroSpeedReplaceOnce",
+                "name": "零速撞种换种(立即一次)",
+                "trigger": "date",
                 "func": self.run_once,
-                "kwargs": {"manual": False},
-            }
-        ]
+                "kwargs": {
+                    "next_run_time": datetime.now() + timedelta(seconds=5),
+                },
+            })
+            # 标记已消费并写回配置，避免反复触发
+            self._onlyonce = False
+            try:
+                cfg = self.get_config() or {}
+                cfg["onlyonce"] = False
+                self.update_config(cfg)
+            except Exception as e:
+                logger.debug(f"{self.plugin_name}: 复位 onlyonce 失败: {e}")
+
+        return services
 
     def _get_downloader_service(self) -> Optional[ServiceInfo]:
         if not self._downloader_helper:
@@ -425,11 +477,13 @@ class ZeroSpeedReplace(_PluginBase):
 
         return merged
 
-    def run_once(self, manual: bool = False):
+    def run_once(self, *args, **kwargs):
         """
         执行一次检查与换种
         """
-        if not self._enabled and not manual:
+        # 手动/定时均执行；仅在未启用时跳过
+        if not self._enabled:
+            logger.warning(f"{self.plugin_name}: 未启用，跳过执行")
             return
 
         service = self._get_downloader_service()
