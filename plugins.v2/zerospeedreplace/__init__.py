@@ -26,7 +26,7 @@ class ZeroSpeedReplace(_PluginBase):
     plugin_name = "零速撞种换种"
     plugin_desc = "下载速度长期为0时自动删种，并按下载历史tmdbid精确搜索换种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
-    plugin_version = "0.2.2"
+    plugin_version = "0.2.4"
     plugin_author = "community"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "zerospeedreplace_"
@@ -387,7 +387,7 @@ class ZeroSpeedReplace(_PluginBase):
             return False
 
         # 防止下次换种又选回这个 hash
-        self._add_blacklist(str(torrent_hash))
+        self._add_blacklist(torrent_hash=str(torrent_hash), title=name)
 
         msg = (
             f"已删除零速任务：{media_title}\n"
@@ -440,15 +440,29 @@ class ZeroSpeedReplace(_PluginBase):
         except Exception as e:
             logger.warning(f"{self.plugin_name}: 写黑名单失败: {e}")
 
-    def _add_blacklist(self, torrent_hash: str):
+    def _add_blacklist(self, torrent_hash: str = None, title: str = None):
         import time
-        if not torrent_hash:
-            return
         data = self._load_blacklist()
         expire = time.time() + float(self._blacklist_hours) * 3600
-        data[torrent_hash.lower()] = expire
+        if torrent_hash:
+            data[str(torrent_hash).lower()] = expire
+            logger.info(f"{self.plugin_name}: 已加入hash黑名单 {torrent_hash} ({self._blacklist_hours}h)")
+        if title:
+            # 用规范化标题做二次排除（搜索结果常无 hash）
+            key = "title:" + self._norm_title(title)
+            if key != "title:":
+                data[key] = expire
+                logger.info(f"{self.plugin_name}: 已加入标题黑名单 {key} ({self._blacklist_hours}h)")
         self._save_blacklist(data)
-        logger.info(f"{self.plugin_name}: 已加入黑名单 {torrent_hash} ({self._blacklist_hours}h)")
+
+    def _norm_title(self, title: str) -> str:
+        import re
+        if not title:
+            return ""
+        t = title.lower()
+        t = re.sub(r"[\[\]\(\)\{\}]", " ", t)
+        t = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", t)
+        return " ".join(t.split())
 
     def _is_blacklisted(self, torrent_hash: str) -> bool:
         if not torrent_hash:
@@ -498,18 +512,37 @@ class ZeroSpeedReplace(_PluginBase):
         contexts = []
         mediainfo = None
 
-        # --- 路径1：tmdbid ---
+        # --- 路径1：tmdbid（V2 用 recognize_media，无 get_tmdb_info）---
         if tmdbid:
             try:
+                tid = int(tmdbid)
+                # 优先带 meta + tmdbid；兼容只传 tmdbid
                 try:
-                    mediainfo = media_chain.get_tmdb_info(mtype=None, tmdbid=int(tmdbid))
+                    meta = MetaInfo(title or torrent_name or "")
+                    mediainfo = media_chain.recognize_media(meta=meta, tmdbid=tid)
                 except TypeError:
-                    # 部分版本签名不同
-                    mediainfo = media_chain.get_tmdb_info(tmdbid=int(tmdbid))
+                    mediainfo = media_chain.recognize_media(tmdbid=tid)
                 except Exception as e:
-                    logger.warning(f"{self.plugin_name}: get_tmdb_info 失败: {e}")
+                    logger.warning(f"{self.plugin_name}: recognize_media(tmdbid) 失败: {e}")
+                    mediainfo = None
+                # 部分版本有 tmdb_info 返回 dict，再包一层
+                if not mediainfo and hasattr(media_chain, "tmdb_info"):
+                    try:
+                        from app.schemas.types import MediaType
+                        info = media_chain.tmdb_info(tmdbid=tid, mtype=None)
+                        if info:
+                            mediainfo = MediaInfo()
+                            # MediaInfo 常见赋值方式因版本而异，尽量稳健
+                            if hasattr(mediainfo, "set_tmdb_info"):
+                                mediainfo.set_tmdb_info(info)
+                            else:
+                                mediainfo.tmdb_id = tid
+                                mediainfo.title = info.get("title") or info.get("name") or title
+                                mediainfo.year = str(info.get("release_date") or info.get("first_air_date") or "")[:4]
+                    except Exception as e:
+                        logger.warning(f"{self.plugin_name}: tmdb_info 回退失败: {e}")
                 if mediainfo:
-                    logger.info(f"{self.plugin_name}: 已用 tmdbid={tmdbid} 识别媒体")
+                    logger.info(f"{self.plugin_name}: 已用 tmdbid={tid} 识别: {getattr(mediainfo, 'title', '')}")
                     try:
                         contexts = search_chain.process(mediainfo=mediainfo) or []
                     except Exception as e:
@@ -555,6 +588,7 @@ class ZeroSpeedReplace(_PluginBase):
                 return 0
 
         blacklist = self._load_blacklist()
+        old_title_key = "title:" + self._norm_title(title or torrent_name or "")
         candidates = []
         for ctx in contexts:
             ti = getattr(ctx, "torrent_info", None)
@@ -562,45 +596,80 @@ class ZeroSpeedReplace(_PluginBase):
                 continue
             th = getattr(ti, "info_hash", None) or getattr(ti, "hash", None) or ""
             th_l = str(th).lower() if th else ""
+            ttitle = getattr(ti, "title", None) or ""
+            tkey = "title:" + self._norm_title(ttitle)
             if th_l and th_l == (old_hash or "").lower():
                 logger.info(f"{self.plugin_name}: 跳过原 hash: {th_l}")
                 continue
             if th_l and th_l in blacklist:
                 logger.info(f"{self.plugin_name}: 跳过黑名单 hash: {th_l}")
                 continue
+            if tkey and tkey in blacklist:
+                logger.info(f"{self.plugin_name}: 跳过黑名单标题: {ttitle}")
+                continue
+            if old_title_key and tkey == old_title_key:
+                logger.info(f"{self.plugin_name}: 跳过同名标题: {ttitle}")
+                continue
             candidates.append(ctx)
 
         if not candidates:
-            return False, f"共{len(contexts)}条结果但均被排除（同hash或无torrent_info）"
+            return False, f"共{len(contexts)}条结果但均被排除（hash/标题黑名单）"
 
         candidates.sort(key=_seeders, reverse=True)
-        chosen = candidates[0]
-        ti = chosen.torrent_info
-        logger.info(
-            f"{self.plugin_name}: 选中替代种 seeders={getattr(ti, 'seeders', 0)} "
-            f"site={getattr(ti, 'site_name', '')} title={getattr(ti, 'title', '')}"
-        )
 
-        # 补齐 media_info
-        media_info = getattr(chosen, "media_info", None) or mediainfo
-        meta_info = getattr(chosen, "meta_info", None)
-        if not media_info:
-            media_info = MediaInfo()
-            media_info.title = getattr(ti, "title", None) or title
+        # 依次尝试前若干候选，避免第一个实际仍是原种
+        last_err = ""
+        for idx, chosen in enumerate(candidates[:8], 1):
+            ti = chosen.torrent_info
+            ttitle = getattr(ti, "title", None) or title
+            logger.info(
+                f"{self.plugin_name}: 尝试候选#{idx} seeders={getattr(ti, 'seeders', 0)} "
+                f"site={getattr(ti, 'site_name', '')} title={ttitle} "
+                f"hash={getattr(ti, 'info_hash', None) or getattr(ti, 'hash', None) or '无'}"
+            )
 
-        if not meta_info:
+            media_info = getattr(chosen, "media_info", None) or mediainfo
+            meta_info = getattr(chosen, "meta_info", None)
+            if not media_info:
+                media_info = MediaInfo()
+                media_info.title = ttitle
+            if not meta_info:
+                try:
+                    meta_info = MetaInfo(ttitle)
+                except Exception:
+                    meta_info = None
+
+            context = Context(meta_info=meta_info, media_info=media_info, torrent_info=ti)
             try:
-                meta_info = MetaInfo(getattr(ti, "title", None) or title)
-            except Exception:
-                meta_info = None
+                try:
+                    download_id = download_chain.download_single(context=context, username="admin")
+                except TypeError:
+                    download_id = download_chain.download_single(context=context)
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(f"{self.plugin_name}: 候选#{idx} 下载异常: {e}")
+                continue
 
-        context = Context(meta_info=meta_info, media_info=media_info, torrent_info=ti)
-        try:
-            download_id = download_chain.download_single(context=context, username="admin")
-        except TypeError:
-            # 兼容不同签名
-            download_id = download_chain.download_single(context=context)
+            if not download_id:
+                last_err = f"download_single 空: {ttitle}"
+                continue
 
-        if download_id:
-            return True, f"已添加下载: {getattr(ti, 'title', title)} (id={download_id})"
-        return False, f"download_single 返回空: {getattr(ti, 'title', title)}"
+            did = str(download_id).lower()
+            # 若下载器返回的仍是已删/黑名单 hash，删掉并试下一个
+            if did == (old_hash or "").lower() or did in blacklist:
+                logger.warning(
+                    f"{self.plugin_name}: 候选#{idx} 下载结果仍是黑名单/原种 hash={did}，删除并换下一个"
+                )
+                self._add_blacklist(torrent_hash=did, title=ttitle)
+                try:
+                    service = self._get_downloader_service()
+                    if service and service.instance:
+                        self._delete_torrent(service.instance, did, ttitle)
+                except Exception as e:
+                    logger.warning(f"{self.plugin_name}: 清理重复种失败: {e}")
+                continue
+
+            # 成功且与原种/黑名单不同
+            return True, f"已添加下载: {ttitle} (id={download_id})"
+
+        return False, last_err or "多个候选均失败或均为原种"
