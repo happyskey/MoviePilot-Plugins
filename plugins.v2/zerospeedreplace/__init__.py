@@ -26,7 +26,7 @@ class ZeroSpeedReplace(_PluginBase):
     plugin_name = "零速撞种换种"
     plugin_desc = "下载速度长期为0时自动删种，并按下载历史tmdbid精确搜索换种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
     plugin_author = "community"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "zerospeedreplace_"
@@ -397,13 +397,9 @@ class ZeroSpeedReplace(_PluginBase):
             return True
 
         if not tmdbid:
-            tip = f"{msg}\n无 tmdbid，无法自动换种"
-            logger.warning(tip)
-            if self._notify:
-                self.post_message(mtype=NotificationType.Download, title=f"【{self.plugin_name}】", text=tip)
-            return True
+            logger.warning(f"{self.plugin_name}: 无 tmdbid，将回退标题搜索换种")
 
-        ok, detail = self._replace_by_tmdbid(int(tmdbid), media_title, str(torrent_hash))
+        ok, detail = self._replace_by_tmdbid(tmdbid, media_title, str(torrent_hash), torrent_name=name)
         logger.info(f"{self.plugin_name}: 换种结果 ok={ok} | {detail}")
         if self._notify:
             self.post_message(
@@ -413,44 +409,144 @@ class ZeroSpeedReplace(_PluginBase):
             )
         return True
 
-    def _replace_by_tmdbid(self, tmdbid: int, title: str, old_hash: str) -> Tuple[bool, str]:
+    def _extract_keyword(self, torrent_name: str) -> str:
+        """从种子名提取搜索关键词（对齐 qboptimizer）"""
+        import re
+        name = torrent_name or ""
+        patterns = [
+            r"\b(1080p|720p|480p|2160p|4K|UHD)\b",
+            r"\b(BluRay|BDRip|DVDRip|WEBRip|WEB-DL|HDTV)\b",
+            r"\b(x264|x265|H\.?264|H\.?265|HEVC)\b",
+            r"\b(AAC|AC3|DTS|FLAC|DDP5\.?1|Atmos)\b",
+            r"\[.*?\]",
+            r"\(.*?\)",
+            r"-\w+$",
+        ]
+        for p in patterns:
+            name = re.sub(p, " ", name, flags=re.IGNORECASE)
+        name = re.sub(r"[.\-_]+", " ", name)
+        name = " ".join(name.split())
+        return name.strip() or torrent_name
+
+    def _replace_by_tmdbid(self, tmdbid, title: str, old_hash: str, torrent_name: str = "") -> Tuple[bool, str]:
+        """
+        换种策略（对齐 qboptimizer）：
+        1) 有 tmdbid 则尽量用媒体识别后精确搜
+        2) 失败则用种子标题关键词 search_by_title
+        3) 排除原 hash，按做种数选最佳，download_single
+        """
         try:
             from app.chain.download import DownloadChain
             from app.chain.search import SearchChain
             from app.chain.media import MediaChain
+            from app.core.context import MediaInfo, Context
+            from app.core.metainfo import MetaInfo
         except Exception as e:
             return False, f"导入链路失败: {e}"
-        try:
-            mediainfo = None
+
+        search_chain = SearchChain()
+        download_chain = DownloadChain()
+        media_chain = MediaChain()
+        contexts = []
+        mediainfo = None
+
+        # --- 路径1：tmdbid ---
+        if tmdbid:
             try:
-                mediainfo = MediaChain().get_tmdb_info(mtype=None, tmdbid=tmdbid)
-            except Exception:
-                pass
-            if not mediainfo:
                 try:
-                    mediainfo = MediaChain().recognize_by_title(title=title)
-                except Exception:
-                    pass
-            if not mediainfo:
-                return False, "无法识别媒体信息"
-            contexts = SearchChain().process(mediainfo=mediainfo) or []
-            if not contexts:
-                return False, "精确搜索无结果（可能被过滤规则滤掉）"
-            chosen = None
-            for ctx in contexts:
-                torrent = getattr(ctx, "torrent_info", None) or getattr(ctx, "torrent", None)
-                if not torrent:
-                    continue
-                th = getattr(torrent, "info_hash", None) or getattr(torrent, "hash", None) or ""
-                if th and str(th).lower() == old_hash.lower():
-                    continue
-                chosen = ctx
-                break
-            if not chosen:
-                return False, "搜索结果仅含原种或无可选资源"
-            DownloadChain().batch_download(contexts=[chosen], media_download_list=[])
-            tname = getattr(getattr(chosen, "torrent_info", None), "title", None) or title
-            return True, f"已尝试添加：{tname}"
-        except Exception as e:
-            logger.error(f"{self.plugin_name}: 换种异常: {e}")
-            return False, f"换种异常: {e}"
+                    mediainfo = media_chain.get_tmdb_info(mtype=None, tmdbid=int(tmdbid))
+                except TypeError:
+                    # 部分版本签名不同
+                    mediainfo = media_chain.get_tmdb_info(tmdbid=int(tmdbid))
+                except Exception as e:
+                    logger.warning(f"{self.plugin_name}: get_tmdb_info 失败: {e}")
+                if mediainfo:
+                    logger.info(f"{self.plugin_name}: 已用 tmdbid={tmdbid} 识别媒体")
+                    try:
+                        contexts = search_chain.process(mediainfo=mediainfo) or []
+                    except Exception as e:
+                        logger.warning(f"{self.plugin_name}: SearchChain.process 失败: {e}")
+            except Exception as e:
+                logger.warning(f"{self.plugin_name}: tmdbid 路径失败: {e}")
+
+        # --- 路径2：MetaInfo 识别 ---
+        if not contexts:
+            try:
+                meta = MetaInfo(title or torrent_name)
+                mediainfo = media_chain.recognize_by_meta(meta)
+                if mediainfo:
+                    logger.info(f"{self.plugin_name}: MetaInfo 识别成功: {getattr(mediainfo, 'title', '')}")
+                    contexts = search_chain.process(mediainfo=mediainfo) or []
+            except Exception as e:
+                logger.warning(f"{self.plugin_name}: MetaInfo 路径失败: {e}")
+
+        # --- 路径3：标题关键词搜索（qboptimizer 主路径）---
+        if not contexts:
+            keyword = self._extract_keyword(torrent_name or title)
+            logger.info(f"{self.plugin_name}: 回退标题搜索关键词: {keyword}")
+            try:
+                for page in range(2):
+                    page_results = search_chain.search_by_title(title=keyword, page=page) or []
+                    if not page_results:
+                        break
+                    contexts.extend(page_results)
+            except Exception as e:
+                logger.error(f"{self.plugin_name}: search_by_title 失败: {e}")
+
+        if not contexts:
+            return False, "搜索无结果（tmdbid/标题均无）"
+
+        # 排除原 hash，按 seeders 选最佳
+        def _seeders(ctx) -> int:
+            ti = getattr(ctx, "torrent_info", None)
+            if not ti:
+                return 0
+            try:
+                return int(getattr(ti, "seeders", 0) or 0)
+            except Exception:
+                return 0
+
+        candidates = []
+        for ctx in contexts:
+            ti = getattr(ctx, "torrent_info", None)
+            if not ti:
+                continue
+            th = getattr(ti, "info_hash", None) or getattr(ti, "hash", None) or ""
+            if th and str(th).lower() == (old_hash or "").lower():
+                continue
+            candidates.append(ctx)
+
+        if not candidates:
+            return False, f"共{len(contexts)}条结果但均被排除（同hash或无torrent_info）"
+
+        candidates.sort(key=_seeders, reverse=True)
+        chosen = candidates[0]
+        ti = chosen.torrent_info
+        logger.info(
+            f"{self.plugin_name}: 选中替代种 seeders={getattr(ti, 'seeders', 0)} "
+            f"site={getattr(ti, 'site_name', '')} title={getattr(ti, 'title', '')}"
+        )
+
+        # 补齐 media_info
+        media_info = getattr(chosen, "media_info", None) or mediainfo
+        meta_info = getattr(chosen, "meta_info", None)
+        if not media_info:
+            media_info = MediaInfo()
+            media_info.title = getattr(ti, "title", None) or title
+
+        if not meta_info:
+            try:
+                meta_info = MetaInfo(getattr(ti, "title", None) or title)
+            except Exception:
+                meta_info = None
+
+        context = Context(meta_info=meta_info, media_info=media_info, torrent_info=ti)
+        try:
+            download_id = download_chain.download_single(context=context, username="admin")
+        except TypeError:
+            # 兼容不同签名
+            download_id = download_chain.download_single(context=context)
+
+        if download_id:
+            return True, f"已添加下载: {getattr(ti, 'title', title)} (id={download_id})"
+        return False, f"download_single 返回空: {getattr(ti, 'title', title)}"
