@@ -13,7 +13,7 @@ from .quark_api import QuarkApi
 
 class QuarkDisk(_PluginBase):
     # 插件名称
-    plugin_name = "夸克网盘存储"
+    plugin_name = "quark夸克网盘"
     # 插件描述
     plugin_desc = "为存储系统集成夸克网盘支持"
     # 插件图标
