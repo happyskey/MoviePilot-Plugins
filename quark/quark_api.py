@@ -122,7 +122,7 @@ class QuarkApi:
     def __init__(self, cookie: str):
         try:
             self._cookie = cookie.strip()
-            self._disk_name = "夸克网盘"
+            self._disk_name = "quark夸克网盘"
             self._base_url = "https://pan.quark.cn/1/clouddrive"
             self._drive_url = "https://drive.quark.cn/1/clouddrive"
             self._drive_pc_url = "https://drive-pc.quark.cn/1/clouddrive"
