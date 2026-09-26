@@ -26,7 +26,7 @@ class ZeroSpeedReplace(_PluginBase):
     plugin_name = "零速撞种换种"
     plugin_desc = "下载速度长期为0时自动删种，并按下载历史tmdbid精确搜索换种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
-    plugin_version = "0.2.5"
+    plugin_version = "0.2.6"
     plugin_author = "community"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "zerospeedreplace_"
