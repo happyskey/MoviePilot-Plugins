@@ -3,7 +3,7 @@
     "name": "零速撞种换种",
     "description": "下载速度长期为0时自动删种，并按下载历史tmdbid精确搜索换种",
     "labels": "下载,做种",
-    "version": "0.2.5",
+    "version": "0.2.6",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png",
     "author": "community",
     "level": 1,
